@@ -35,6 +35,26 @@ def _resolve_inputs(context, settings):
     return inputs
 
 
+def _store_report(context, info):
+    """Put the Game-Ready Rebuild quality report into the Analysis panel."""
+    res = info["object"]
+    st = context.scene.auto_retopo_stats
+    for key, value in core.mesh_stats(res.data).items():
+        setattr(st, key, value)
+    rep = info["report"]
+    st.object_name = res.name
+    st.has_report = True
+    st.dev_avg = rep["rms_pct"]
+    st.dev_max = rep["max_pct"]
+    st.budget = rep["budget"]
+    style = {'QUADS': "Clean Quads", 'DIRECT': "Clean Quads (direct)",
+             'ADAPTIVE': "Adaptive"}.get(rep["style"], rep["style"])
+    seed = f", seed {rep['seed']}" if rep["style"] in {'QUADS', 'DIRECT'} else ""
+    st.winner = f"{style}{seed} (best of {rep['candidates']})"
+    st.maps = ", ".join(img.name for img in info.get("images", [])) or "none"
+    st.lods = ", ".join(f"{core.mesh_tri_count(o.data):,}" for o in info.get("lods", [])) or "none"
+
+
 def _ensure_object_mode(context):
     if context.mode != 'OBJECT' and context.active_object is not None:
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -106,10 +126,19 @@ class AUTORETOPO_OT_run(Operator):
                 res.select_set(True)
                 context.view_layer.objects.active = res
 
+        if results[-1].get("report"):
+            _store_report(context, results[-1])
         if len(results) == 1:
             r = results[0]
-            self.report({'INFO'}, (f"{r['object'].name}: {r['input_faces']:,} -> "
-                                   f"{r['output_faces']:,} faces in {r['time']:.1f}s"))
+            if r.get("report"):
+                rep = r["report"]
+                self.report({'INFO'}, (f"{r['object'].name}: rebuilt with {rep['tris']:,} tris "
+                                       f"(budget {rep['budget']:,}), deviation "
+                                       f"{rep['rms_pct']:.2f}% avg / {rep['max_pct']:.2f}% max "
+                                       f"in {r['time']:.1f}s"))
+            else:
+                self.report({'INFO'}, (f"{r['object'].name}: {r['input_faces']:,} -> "
+                                       f"{r['output_faces']:,} faces in {r['time']:.1f}s"))
         else:
             total = sum(r['time'] for r in results)
             self.report({'INFO'}, f"Retopologized {len(results)} objects in {total:.1f}s"
@@ -140,6 +169,7 @@ class AUTORETOPO_OT_analyze(Operator):
             ob_eval.to_mesh_clear()
         target = context.scene.auto_retopo_stats
         target.object_name = ob.name
+        target.has_report = False
         for key, value in stats.items():
             setattr(target, key, value)
         self.report({'INFO'}, f"{ob.name}: {stats['faces']:,} faces, {stats['quads']:,} quads, "

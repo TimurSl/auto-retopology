@@ -32,6 +32,44 @@ METHOD_ITEMS = [
      "Reduce the existing topology (keeps UVs and attributes best)", 'MOD_DECIM', 2),
     ('OCTREE', "Octree Remesh",
      "Classic Remesh modifier: Blocks, Smooth or Sharp modes", 'MOD_REMESH', 3),
+    ('REBUILD', "Game-Ready Rebuild",
+     "Rebuild the topology from scratch: same shape, best of several candidate topologies, "
+     "game rules, UVs, baked normal map and LODs", 'SHADERFX', 4),
+]
+
+REBUILD_STYLE_ITEMS = [
+    ('QUADS', "Clean Quads",
+     "Even, all-quad edge flow. Best for characters and anything that deforms"),
+    ('ADAPTIVE', "Adaptive",
+     "Curvature adaptive: dense where the shape needs it, sparse where flat. Best silhouette "
+     "per triangle for static props"),
+    ('BEST', "Best of Both",
+     "Build both styles and keep whichever scores better"),
+]
+
+PRIORITY_ITEMS = [
+    ('SHAPE', "Shape", "Prefer the candidate closest to the original shape"),
+    ('BALANCED', "Balanced", "Weigh shape accuracy and topology quality equally"),
+    ('TOPOLOGY', "Topology", "Prefer the cleanest topology (fewest poles and folds)"),
+]
+
+GAME_SHADING_ITEMS = [
+    ('SMOOTH_HARD', "Smooth + Hard Edges",
+     "Smooth shading with hard edges above the angle (split in UVs for clean bakes)"),
+    ('WEIGHTED', "Weighted Normals",
+     "Face-area weighted normals with hard edges - flat faces stay flat (hard surface)"),
+    ('SMOOTH', "Fully Smooth", "Everything smooth, the normal map carries all detail (organic)"),
+]
+
+TEXTURE_SIZE_ITEMS = [
+    ('256', "256", ""), ('512', "512", ""), ('1024', "1024", ""),
+    ('2048', "2048", ""), ('4096', "4096", ""),
+]
+
+ORIGIN_ITEMS = [
+    ('KEEP', "Keep", "Keep the original origin"),
+    ('BOTTOM', "Bottom Center", "Origin at the bottom center of the bounds (props on the ground)"),
+    ('CENTER', "Bounds Center", "Origin at the center of the bounds"),
 ]
 
 DENSITY_ITEMS = [
@@ -314,6 +352,79 @@ class AutoRetopoSettings(PropertyGroup):
     )
     oc_threshold: FloatProperty(name="Threshold", default=1.0, min=0.0, max=1.0, subtype='FACTOR')
 
+    # ----- Game-Ready Rebuild ------------------------------------------------
+    gr_style: EnumProperty(name="Topology Style", items=REBUILD_STYLE_ITEMS, default='QUADS')
+    gr_candidates: IntProperty(
+        name="Candidates", default=3, min=1, max=8,
+        description="How many quad topologies to build and compare (more = better pick, slower)",
+    )
+    gr_priority: EnumProperty(name="Pick By", items=PRIORITY_ITEMS, default='BALANCED')
+    gr_count_triangles: BoolProperty(
+        name="Budget in Triangles", default=True,
+        description="Interpret the face count as a triangle budget, the way game engines count",
+    )
+    gr_shell_detail: FloatProperty(
+        name="Shape Detail", default=5.0, min=1.0, soft_max=12.0,
+        description="Resolution of the watertight shape the rebuild starts from, relative to "
+                    "the target edge length (higher keeps finer shape detail, slower)",
+    )
+    gr_try_direct: BoolProperty(
+        name="Try Direct Remesh", default=True,
+        description="When the original is closed and manifold (also several closed parts that "
+                    "intersect), additionally remesh its exact surface. Keeps sharp edges crisp "
+                    "and parts separate; the scoring decides which candidate wins",
+    )
+    gr_adaptive_quads: BoolProperty(
+        name="Quad-Dominant", default=True,
+        description="Join the adaptive triangles into quads where they form good quads",
+    )
+    gr_hard_angle: FloatProperty(
+        name="Hard Edge Angle", default=math.radians(60.0), min=0.0, max=math.pi,
+        subtype='ANGLE', description="Edges sharper than this become hard edges",
+    )
+    gr_seams_at_hard: BoolProperty(
+        name="UV Seams at Hard Edges", default=True,
+        description="Split UV islands at hard edges - required for artifact-free normal maps",
+    )
+    gr_shading: EnumProperty(name="Normals", items=GAME_SHADING_ITEMS, default='SMOOTH_HARD')
+    gr_triangulate: BoolProperty(
+        name="Triangulate", default=False,
+        description="Triangulate the final mesh so the triangulation (and the baked normal map) "
+                    "is locked exactly as the game engine will see it",
+    )
+    gr_unwrap: BoolProperty(name="Unwrap UVs", default=True,
+                            description="Unwrap, equalize texel density and pack the UVs")
+    gr_texture_size: EnumProperty(name="Texture Size", items=TEXTURE_SIZE_ITEMS, default='1024',
+                                  description="Size of the baked maps; also sets UV padding")
+    gr_padding: IntProperty(name="Padding (px)", default=8, min=0, max=64,
+                            description="Pixels between UV islands and bake margin")
+    gr_bake_normal: BoolProperty(
+        name="Normal Map", default=True,
+        description="Bake the original's surface detail into a tangent-space normal map",
+    )
+    gr_bake_ao: BoolProperty(name="Ambient Occlusion", default=False,
+                             description="Bake an ambient occlusion map from the original")
+    gr_ao_samples: IntProperty(name="AO Samples", default=32, min=1, max=1024)
+    gr_cage_extrusion: FloatProperty(
+        name="Cage Extrusion", default=0.0, min=0.0, soft_max=1.0, subtype='DISTANCE', precision=4,
+        description="Ray distance for baking (0 = automatic, from the measured deviation)",
+    )
+    gr_bake_dir: StringProperty(
+        name="Save To", default="", subtype='DIR_PATH',
+        description="Folder for the baked PNGs. Empty = pack them into the .blend file",
+    )
+    gr_lod_count: IntProperty(name="LODs", default=2, min=0, max=5,
+                              description="Extra levels of detail to generate (LOD1, LOD2, ...)")
+    gr_lod_ratio: FloatProperty(name="Reduction", default=0.5, min=0.05, max=0.95,
+                                subtype='FACTOR', description="Triangle ratio between LOD levels")
+    gr_lod_spread: BoolProperty(name="Place Side by Side", default=True,
+                                description="Offset LODs along X so they can be compared")
+    gr_origin: EnumProperty(name="Origin", items=ORIGIN_ITEMS, default='KEEP')
+    gr_apply_rotation: BoolProperty(
+        name="Apply Rotation", default=False,
+        description="Bake the rotation into the mesh so the asset exports with identity transform",
+    )
+
     # ----- Symmetry ---------------------------------------------------------
     use_symmetry: BoolProperty(
         name="Symmetry", default=False,
@@ -464,6 +575,15 @@ class AutoRetopoStats(PropertyGroup):
     islands: IntProperty()
     area: FloatProperty(unit='AREA')
     avg_edge: FloatProperty(subtype='DISTANCE')
+    tri_count: IntProperty()
+    # Game-Ready Rebuild report
+    has_report: BoolProperty()
+    dev_avg: FloatProperty(subtype='PERCENTAGE')
+    dev_max: FloatProperty(subtype='PERCENTAGE')
+    budget: IntProperty()
+    winner: StringProperty()
+    maps: StringProperty()
+    lods: StringProperty()
 
 
 classes = (AutoRetopoSettings, AutoRetopoStats)

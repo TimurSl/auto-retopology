@@ -12,7 +12,35 @@ from .properties import AutoRetopoSettings
 PRESET_SUBDIR = "auto_retopology"
 
 # Every setting not listed in a preset falls back to its default.
-QUICK_PRESETS = {
+GAME_READY_PRESETS = {
+    'GR_PROP': dict(
+        label="Game-Ready Prop (Rebuild)",
+        description="Rebuild a static prop: 3k triangle budget, best of quads/adaptive, "
+                    "normal map, 2 LODs, origin at the bottom",
+        values=dict(method='REBUILD', target_faces=3000, gr_style='BEST',
+                    gr_origin='BOTTOM', gr_lod_count=2),
+    ),
+    'GR_CHARACTER': dict(
+        label="Game-Ready Character (Rebuild)",
+        description="Rebuild a character: 8k triangles of clean symmetric quads, fully "
+                    "smooth normals with the detail in the normal map, 2 LODs",
+        values=dict(method='REBUILD', target_faces=8000, gr_style='QUADS', use_symmetry=True,
+                    gr_shading='SMOOTH', gr_priority='TOPOLOGY', gr_texture_size='2048',
+                    gr_lod_count=2),
+    ),
+    'GR_HARD': dict(
+        label="Game-Ready Hard Surface (Rebuild)",
+        description="Rebuild a hard-surface asset: sharp features kept, weighted normals, "
+                    "hard edges split in UVs, normal + AO maps",
+        values=dict(method='REBUILD', target_faces=4000, gr_style='QUADS',
+                    qf_preserve_sharp=True, gr_shading='WEIGHTED',
+                    gr_hard_angle=math.radians(40.0), gr_shell_detail=7.0,
+                    relax_iterations=1, gr_priority='SHAPE', gr_bake_ao=True,
+                    gr_origin='BOTTOM', gr_lod_count=2),
+    ),
+}
+
+CLASSIC_PRESETS = {
     'GAME_LOW': dict(
         label="Game Asset - Low Poly",
         description="~1.5k quads, auto smooth shading and a fresh UV unwrap",
@@ -78,6 +106,8 @@ QUICK_PRESETS = {
     ),
 }
 
+QUICK_PRESETS = {**GAME_READY_PRESETS, **CLASSIC_PRESETS}
+
 
 def setting_names():
     return [name for name in AutoRetopoSettings.__annotations__.keys()]
@@ -128,9 +158,12 @@ class AUTORETOPO_MT_quick_presets(Menu):
 
     def draw(self, context):
         layout = self.layout
-        for key, data in QUICK_PRESETS.items():
-            layout.operator(AUTORETOPO_OT_quick_preset.bl_idname,
-                            text=data['label']).preset = key
+        for group in (GAME_READY_PRESETS, CLASSIC_PRESETS):
+            for key, data in group.items():
+                layout.operator(AUTORETOPO_OT_quick_preset.bl_idname,
+                                text=data['label']).preset = key
+            if group is GAME_READY_PRESETS:
+                layout.separator()
 
 
 class AUTORETOPO_MT_user_presets(Menu):

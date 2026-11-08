@@ -491,8 +491,186 @@ def test_all_quick_presets_run():
             s.target_faces = min(s.target_faces, 1500)
         if s.subdiv_mode == 'MULTIRES':
             s.subdiv_levels = 1
+        if s.method == 'REBUILD':  # keep the suite fast
+            s.gr_candidates = 1
+            s.gr_texture_size = '256'
+            s.gr_ao_samples = 4
         res = run_op()
         assert len(res.data.polygons) > 0, key
+
+
+# ---------------------------------------------------------------------------
+# Game-Ready Rebuild
+# ---------------------------------------------------------------------------
+
+def make_blob(name="blob"):
+    from mathutils import noise
+    me = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+    bmesh.ops.create_icosphere(bm, subdivisions=5, radius=1.0)
+    for v in bm.verts:
+        n = v.co.normalized()
+        v.co = n * (1.0 + 0.25 * noise.noise(n * 2.0) + 0.05 * noise.noise(n * 7.0))
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new(name, me)
+    bpy.context.scene.collection.objects.link(ob)
+    select_only(ob)
+    return ob
+
+
+def rebuild_settings(**kw):
+    s = settings()
+    s.method = 'REBUILD'
+    s.gr_texture_size = '256'
+    for k, v in kw.items():
+        setattr(s, k, v)
+    return s
+
+
+def tri_count(ob):
+    return sum(len(p.vertices) - 2 for p in ob.data.polygons)
+
+
+@case
+def test_rebuild_game_ready_defaults():
+    reset_scene()
+    src = make_blob()
+    rebuild_settings(target_faces=2000)
+    res = run_op()
+    tris = tri_count(res)
+    assert 1600 <= tris <= 2400, tris
+    assert all(len(p.vertices) <= 4 for p in res.data.polygons), "n-gons left"
+    assert quad_ratio(res) > 0.9
+    st = bpy.context.scene.auto_retopo_stats
+    assert st.has_report and st.object_name == res.name
+    assert st.non_manifold == 0 and st.boundary == 0
+    assert st.dev_avg < 1.0, st.dev_avg
+    # 3 shell candidates + 2 direct ones (the blob is closed and manifold)
+    assert st.winner.startswith("Clean Quads") and "best of 5" in st.winner, st.winner
+    # UVs, seams, baked + packed normal map wired into a game material
+    assert len(res.data.uv_layers) == 1
+    mat = res.data.materials[0]
+    assert mat.get("auto_retopo_generated")
+    tex = [n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE']
+    assert len(tex) == 1 and tex[0].image.size[0] == 256
+    assert tex[0].image.packed_file is not None
+    assert any(link.to_node.type == 'NORMAL_MAP' for link in mat.node_tree.links)
+    # LODs: two levels, decreasing triangle counts, linked to the source
+    lods = sorted((o for o in bpy.data.objects if "_LOD" in o.name), key=lambda o: o.name)
+    assert [o.name for o in lods] == [res.name + "_LOD1", res.name + "_LOD2"]
+    assert tris > tri_count(lods[0]) > tri_count(lods[1]) > 0
+    assert all(o.auto_retopo_source is src for o in lods)
+    assert max_surface_distance(res, src) < 0.05
+
+
+@case
+def test_rebuild_styles():
+    # BEST with 2 candidates: 2 shell quads + 1 direct quads + 1 adaptive
+    for style, cands in (('ADAPTIVE', "best of 1"), ('BEST', "best of 4")):
+        reset_scene()
+        make_blob()
+        rebuild_settings(target_faces=1500, gr_style=style, gr_candidates=2,
+                         gr_bake_normal=False, gr_lod_count=0)
+        res = run_op()
+        st = bpy.context.scene.auto_retopo_stats
+        assert cands in st.winner, (style, st.winner)
+        tris = tri_count(res)
+        assert 1200 <= tris <= 1800, (style, tris)
+        assert st.non_manifold == 0
+
+
+@case
+def test_rebuild_direct_keeps_intersecting_parts_crisp():
+    """Closed, intersecting parts can win as a direct remesh and stay separate parts."""
+    reset_scene()
+    me = bpy.data.meshes.new("kit")
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.6)
+    cyl = bmesh.ops.create_cone(bm, cap_ends=True, segments=48, radius1=0.45, radius2=0.45,
+                                depth=0.5)
+    bmesh.ops.translate(bm, verts=cyl['verts'], vec=(0, 0, 0.95))
+    bm.to_mesh(me)
+    bm.free()
+    src = bpy.data.objects.new("kit", me)
+    bpy.context.scene.collection.objects.link(src)
+    select_only(src)
+    rebuild_settings(target_faces=1500, gr_candidates=1, qf_preserve_sharp=True,
+                     gr_priority='SHAPE', gr_bake_normal=False, gr_lod_count=0)
+    s = settings()
+    s.gr_try_direct = False
+    run_op()
+    shell_dev = bpy.context.scene.auto_retopo_stats.dev_avg
+    s.gr_try_direct = True
+    run_op()
+    st = bpy.context.scene.auto_retopo_stats
+    assert "direct" in st.winner, st.winner
+    assert st.islands == 2, st.islands  # box and cylinder stay separate parts
+    assert st.dev_avg < shell_dev, (st.dev_avg, shell_dev)
+
+
+@case
+def test_rebuild_rerun_purges_old_bakes():
+    reset_scene()
+    make_blob()
+    rebuild_settings(target_faces=800, gr_candidates=1, gr_bake_ao=True, gr_ao_samples=2)
+    run_op()
+    counts = (len(bpy.data.images), len(bpy.data.materials))
+    run_op()  # re-run from the selected result
+    assert (len(bpy.data.images), len(bpy.data.materials)) == counts, counts
+    assert len([o for o in bpy.data.objects]) == 4  # source, result, 2 LODs
+
+
+@case
+def test_rebuild_symmetry_triangulate_origin():
+    reset_scene()
+    bpy.ops.mesh.primitive_torus_add()
+    src = bpy.context.active_object
+    src.modifiers.new("Sub", 'SUBSURF').levels = 2
+    src.rotation_euler = (0.0, 0.0, 0.4)
+    select_only(src)
+    rebuild_settings(target_faces=1200, gr_candidates=1, use_symmetry=True,
+                     gr_triangulate=True, gr_origin='BOTTOM', gr_apply_rotation=True,
+                     gr_bake_normal=False, gr_lod_count=1)
+    res = run_op()
+    assert set(face_sizes(res)) == {3}
+    assert tuple(round(c, 5) for c in res.rotation_euler) == (0, 0, 0)
+    assert abs(min(v.co.z for v in res.data.vertices)) < 1e-4
+    assert abs(res.location.z - (-0.25)) < 0.03, res.location
+    # Symmetry is in the original's local space; check it in that frame.
+    inv = src.matrix_world.inverted()
+    tmp = res.data.copy()
+    tmp.transform(inv @ res.matrix_world)
+    holder = bpy.data.objects.new("sym_check", tmp)
+    assert_symmetric(holder, 0, tol=2e-3)
+
+
+@case
+def test_rebuild_hard_surface_weighted():
+    reset_scene()
+    src = make_object("cube")
+    import math as _m
+    rebuild_settings(target_faces=1200, gr_candidates=1, qf_preserve_sharp=True,
+                     gr_shading='WEIGHTED', gr_hard_angle=_m.radians(50), gr_lod_count=0)
+    res = run_op()
+    assert res.data.has_custom_normals
+    sharp = sum(e.use_edge_sharp for e in res.data.edges)
+    seams = sum(e.use_seam for e in res.data.edges)
+    assert sharp >= 12 and seams >= sharp, (sharp, seams)
+
+
+@case
+def test_rebuild_bake_to_folder_and_replace():
+    import tempfile
+    reset_scene()
+    src = make_blob()
+    out = tempfile.mkdtemp()
+    rebuild_settings(target_faces=800, gr_candidates=1, gr_bake_dir=out, output_mode='REPLACE')
+    res = run_op()
+    assert res is src
+    assert len(bpy.data.objects) == 1, "no LODs or temp objects in replace mode"
+    files = os.listdir(out)
+    assert files == ["blob_normal.png"], files
 
 
 @case
@@ -537,7 +715,7 @@ def test_ui_panels_draw():
     src = make_object("monkey")
     s = settings()
     log = []
-    for method in ('QUADRIFLOW', 'VOXEL', 'DECIMATE', 'OCTREE'):
+    for method in ('QUADRIFLOW', 'VOXEL', 'DECIMATE', 'OCTREE', 'REBUILD'):
         s.method = method
         for dc in ('COLLAPSE', 'UNSUBDIV', 'DISSOLVE'):
             s.dc_mode = dc
@@ -557,8 +735,25 @@ def test_ui_panels_draw():
                                     cls.draw_header(panel, bpy.context)
                                 if hasattr(cls, "draw_header_preset"):
                                     cls.draw_header_preset(panel, bpy.context)
-    # Stats section
+    s.method = 'REBUILD'
+    for style in ('QUADS', 'ADAPTIVE', 'BEST'):
+        s.gr_style = style
+        for shading in ('SMOOTH_HARD', 'WEIGHTED', 'SMOOTH'):
+            s.gr_shading = shading
+            for flag in (False, True):
+                s.gr_unwrap = s.gr_triangulate = s.gr_count_triangles = flag
+                for cls in ui.panels:
+                    cls.draw(FakePanel(log), bpy.context)
+    # Panel visibility per method
+    assert ui.AUTORETOPO_PT_game_finish.poll(bpy.context)
+    assert not ui.AUTORETOPO_PT_subdiv.poll(bpy.context)
+    s.method = 'QUADRIFLOW'
+    assert not ui.AUTORETOPO_PT_game_finish.poll(bpy.context)
+    assert ui.AUTORETOPO_PT_cleanup.poll(bpy.context)
+    # Stats section, plain and with a Game-Ready report
     bpy.ops.auto_retopo.analyze()
+    ui.AUTORETOPO_PT_tools.draw(FakePanel(log), bpy.context)
+    bpy.context.scene.auto_retopo_stats.has_report = True
     ui.AUTORETOPO_PT_tools.draw(FakePanel(log), bpy.context)
     presets.AUTORETOPO_MT_quick_presets.draw(FakePanel(log), bpy.context)
     ui.AUTORETOPO_MT_object.draw(FakePanel(log), bpy.context)
