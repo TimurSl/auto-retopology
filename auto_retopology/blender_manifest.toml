@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "auto_retopology"
+version = "1.0.0"
+name = "Auto Retopology"
+tagline = "Configurable one-click quad retopology with many options"
+maintainer = "TimurSl"
+type = "add-on"
+
+website = "https://github.com/TimurSl/auto-retopology"
+
+tags = ["Mesh", "Modeling", "Sculpt"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Saves user presets to the Blender presets folder"
