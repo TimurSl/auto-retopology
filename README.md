@@ -1,18 +1,66 @@
 # Auto Retopology for Blender
 
 One-click, highly configurable automatic retopology. Pick a method and a density, press
-**Retopologize**, and get a clean quad mesh projected back onto your original. 90
+**Retopologize**, and get a clean quad mesh projected back onto your original. 114
 settings let you tune each stage, from input cleanup to multires detail baking.
+
+New in 1.1: **Game-Ready Rebuild**, which throws the original topology away and rebuilds the
+same shape as a game asset, with a baked normal map, UVs and LODs.
 
 ![Before / after: noisy sculpt, beveled hard-surface box, symmetric torus](docs/before_after.png)
 
 *Left of each pair: original. Right: Auto Retopology result (QuadriFlow, default settings
 + target face count; the box uses **Preserve Sharp**, the torus uses **Symmetry X**).*
 
+## Game-Ready Rebuild
+
+![Game-Ready Rebuild: original, rebuilt topology, rebuilt low poly with its baked normal map](docs/game_ready_rebuild.png)
+
+*Left: original. Middle: rebuilt topology. Right: the rebuilt low poly rendered with its baked
+normal map. Top: 81,920-triangle sculpt rebuilt to 2,350 triangles (0.22% average deviation).
+Bottom: hard-surface kitbash (box, cylinder and rails as intersecting parts) rebuilt to 2,946
+triangles with the* Game-Ready Hard Surface *settings.*
+
+Choose **Game-Ready Rebuild** as the method (or a *Game-Ready* quick preset), set a
+**Triangle Budget**, and press **Retopologize**. Nothing of the original edge flow is kept:
+
+1. **Shape capture**: the original is converted into a watertight voxel shell at
+   *Shape Detail* × the target resolution. This repairs holes, overlaps and broken geometry.
+2. **Candidates**: several topologies are built and compared:
+   - *Clean Quads*: QuadriFlow from the shell, one per seed (*Candidates*).
+   - *Direct*: QuadriFlow on the exact original surface, used only when the original is
+     closed and manifold, including several closed parts that intersect. This keeps sharp
+     edges crisp and separate parts separate.
+   - *Adaptive*: curvature-adaptive QEM reduction, joined into quads. It is dense where the
+     shape needs detail and sparse where it is flat, which gives the best silhouette per
+     triangle for static props.
+3. **Scoring**: each candidate is relaxed onto the surface and scored on shape deviation and
+   topology quality. Deviation is measured both ways, so lost silhouette counts as well as
+   faces that cut corners. Topology quality counts poles, valence-2/6+ vertices, fold-overs,
+   quad ratio and n-gons. *Pick By* (Shape / Balanced / Topology) sets the balance, and the
+   best-scoring candidate wins.
+4. **Game mesh rules**: the result has no n-gons, no stray valence-2 vertices and no loose
+   geometry, and its normals are consistent. Hard edges are set by angle and get UV seams
+   (needed for clean normal-map bakes). Shading can be *smooth + hard edges*,
+   *weighted normals* (hard surface) or *fully smooth* (organic). Triangulation is optional
+   and locks the bake.
+5. **UVs**: Smart UV Project split at hard edges, then uniform texel density, then packing
+   with pixel padding for the chosen texture size.
+6. **Baking**: a tangent-space normal map (and optionally AO) is baked from the original with
+   Cycles. The cage size comes from the measured deviation. The maps are packed into the
+   .blend or saved as PNGs, and wired into a new PBR material.
+7. **LODs, origin and report**: LOD1…LODn are generated (placed side by side if you like).
+   The origin can move to the bottom/center and the rotation can be applied. A quality report
+   (triangles vs budget, average/max deviation as a percentage of the object's size, winning
+   candidate, baked maps, LOD triangle counts) appears under **Tools & Analysis**.
+
+Re-running the selected result replaces it together with its LODs, material and baked
+images, so nothing piles up.
+
 ## Features
 
-- **4 methods**: QuadriFlow quad remesh, Voxel remesh, Decimate (Collapse / Un-Subdivide /
-  Planar) and Octree remesh (Blocks / Smooth / Sharp).
+- **5 methods**: QuadriFlow quad remesh, Voxel remesh, Decimate (Collapse / Un-Subdivide /
+  Planar), Octree remesh (Blocks / Smooth / Sharp) and **Game-Ready Rebuild**.
 - **Unified density control**: target face count, ratio of the input, or edge length in world
   units, applied the same way by every method.
 - **Robust input handling**: a voxel cleanup pass makes any mesh manifold for QuadriFlow, heavy
@@ -34,8 +82,9 @@ settings let you tune each stage, from input cleanup to multires detail baking.
 - **Workflow**: batch-process all selected objects. Select a result to re-run it with new
   settings (the old result is replaced). There is a "replace mesh" output mode, an output
   collection, and display options for the original and the result.
-- **Presets**: 9 built-in quick presets (Game Low/Mid/LOD, Organic, Sculpt Base, Hard
-  Surface, 3D Scan, Fast Preview, Voxel Art). You can also save your own user presets.
+- **Presets**: 12 built-in quick presets (Game-Ready Prop / Character / Hard Surface rebuilds,
+  Game Low/Mid/LOD, Organic, Sculpt Base, Hard Surface, 3D Scan, Fast Preview, Voxel Art).
+  You can also save your own user presets.
 - **Tools**: mesh analysis (quads/tris/n-gons, poles, islands, non-manifold edges, average
   edge length), toggle between original and result, apply the live retopo modifiers, and a
   **Manual Retopo Setup** that adds snapping, shrinkwrap and mirror for hand retopology.
@@ -82,6 +131,18 @@ previous result.
 | Voxel | Adaptivity, Fix Poles, Preserve Volume, Preserve Attributes |
 | Decimate | Type (Collapse / Un-Subdivide / Planar), Triangulate, Convert to Quads, Iterations, Angle Limit, Delimit |
 | Octree | Mode (Blocks / Smooth / Sharp), Depth from Density, Octree Depth, Scale, Sharpness, Remove Disconnected + Threshold |
+| Game-Ready Rebuild | Topology Style (Clean Quads / Adaptive / Best of Both), Candidates, Pick By, Budget in Triangles, Shape Detail, Quad-Dominant, Preserve Sharp / Boundaries, Base Seed, Try Direct Remesh |
+
+### Game-Ready Finish, Baking & LODs (Game-Ready Rebuild only)
+| Panel | Settings |
+|---|---|
+| Game-Ready Finish | Normals (Smooth + Hard Edges / Weighted Normals / Fully Smooth), Hard Edge Angle, UV Seams at Hard Edges, Triangulate (+ quad method), Unwrap UVs, Angle Limit, Texture Size, Padding (px), Origin (Keep / Bottom Center / Bounds Center), Apply Rotation |
+| Texture Baking | Normal Map, Ambient Occlusion (+ samples), Cage Extrusion (0 = automatic), Save To folder (empty = pack into .blend) |
+| LODs | Count, Reduction per level, Place Side by Side |
+
+When Game-Ready Rebuild is selected, the *Topology & Shading* and *Subdivision* panels are
+hidden, because the rebuild handles these itself. Pre-processing, Symmetry, Relax & Projection,
+data transfer (colors / vertex groups) and Output all still apply.
 
 ### Pre-processing
 Apply Modifiers · Use World Scale · Merge by Distance (+ distance) · Delete Loose ·
@@ -118,6 +179,15 @@ Sidebar tab name · Max voxel resolution (memory safety limit) · Show tips · L
 
 ## Tips
 
+- **Game assets in one click**: pick *Game-Ready Prop*, *Character* or *Hard Surface*,
+  adjust the triangle budget, and press **Retopologize**.
+- **Rebuild picks a messy topology?** Set *Pick By* to *Topology*. If the silhouette suffers
+  instead, choose *Shape*, or use *Best of Both* with *Adaptive* for static props.
+- **Hard-surface kitbash** made of closed, intersecting parts: keep *Try Direct Remesh* on,
+  so edges stay crisp and parts stay separate.
+- **Baking takes the longest**: lower the *Texture Size*, turn off AO, or reduce
+  *Candidates* while you iterate.
+
 - **QuadriFlow fails?** Keep **Voxel Cleanup** enabled. It makes any input watertight. Increase
   *Cleanup Detail* to keep finer features.
 - **Thin parts disappear** (ears, fingers, cloth)? Increase the target face count or use a
@@ -147,7 +217,8 @@ print(info["object"].name, info["output_faces"], info["warnings"])
 
 ## Development
 
-Run the headless test suite (25 tests covering every method, option path and UI panel):
+Run the headless test suite (32 tests covering every method, option path, the Game-Ready
+Rebuild, and every UI panel):
 
 ```bash
 blender --background --factory-startup --python tests/test_addon.py

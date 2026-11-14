@@ -7,11 +7,12 @@ Sidebar: 3D Viewport > N > Retopo
 bl_info = {
     "name": "Auto Retopology",
     "author": "TimurSl",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Retopo",
-    "description": "Automatic quad retopology with QuadriFlow, Voxel, Decimate and Octree "
-                   "methods plus symmetry, relax, projection, UV and detail baking options",
+    "description": "Automatic retopology (QuadriFlow, Voxel, Decimate, Octree) and a "
+                   "Game-Ready Rebuild with baked normal maps and LODs, plus symmetry, "
+                   "relax, projection, UV and detail baking options",
     "category": "Mesh",
     "doc_url": "https://github.com/TimurSl/auto-retopology",
     "tracker_url": "https://github.com/TimurSl/auto-retopology/issues",
@@ -19,10 +20,10 @@ bl_info = {
 
 if "bpy" in locals():
     import importlib
-    for _mod in (properties, core, presets, operators, ui, preferences):  # noqa: F821
+    for _mod in (properties, core, rebuild, presets, operators, ui, preferences):  # noqa: F821
         importlib.reload(_mod)
 else:
-    from . import properties, core, presets, operators, ui, preferences
+    from . import properties, core, rebuild, presets, operators, ui, preferences  # noqa: F401
 
 import bpy  # noqa: E402
 

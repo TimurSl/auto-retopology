@@ -193,6 +193,7 @@ def mesh_stats(me):
             verts=len(bm.verts), faces=len(bm.faces), tris=tris, quads=quads, ngons=ngons,
             poles=poles, non_manifold=non_manifold, boundary=boundary,
             islands=len(face_islands(bm)), area=bm_area(bm), avg_edge=avg_edge,
+            tri_count=bm_tri_count(bm),
         )
     finally:
         bm.free()
@@ -527,7 +528,7 @@ def decimate_to(context, obj, target_tris):
     apply_all_modifiers(context, obj)
 
 
-def run_quadriflow(context, obj, s, target, warnings):
+def run_quadriflow(context, obj, s, target, warnings, seed=None):
     me = obj.data
     native = s.use_symmetry and s.qf_native_symmetry
     axis = s.symmetry_axis if native else None
@@ -549,13 +550,14 @@ def run_quadriflow(context, obj, s, target, warnings):
 
     edit_bmesh(obj, collapse_tiny)
     try:
-        _quadriflow_attempts(context, obj, s, target, warnings)
+        _quadriflow_attempts(context, obj, s, target, warnings, seed)
     finally:
         obj.data.transform(Matrix.Scale(1.0 / factor, 4))
         obj.data.update()
 
 
-def _quadriflow_attempts(context, obj, s, target, warnings):
+def _quadriflow_attempts(context, obj, s, target, warnings, seed=None):
+    base_seed = s.qf_seed if seed is None else seed
     error = "unknown error"
     for attempt in range(s.qf_retries + 1):
         try:
@@ -566,13 +568,13 @@ def _quadriflow_attempts(context, obj, s, target, warnings):
                     use_preserve_boundary=s.qf_preserve_boundary,
                     preserve_attributes=s.qf_preserve_attributes,
                     smooth_normals=s.qf_smooth_normals,
-                    mode='FACES', target_faces=target, seed=s.qf_seed + attempt)
+                    mode='FACES', target_faces=target, seed=base_seed + attempt)
         except RuntimeError as exc:
             error = str(exc).strip().replace("Error: ", "")
             continue
         if 'FINISHED' in result and len(obj.data.polygons) > 0:
             if attempt:
-                warnings.append(f"QuadriFlow succeeded with seed {s.qf_seed + attempt}")
+                warnings.append(f"QuadriFlow succeeded with seed {base_seed + attempt}")
             return
         error = "no output"
     hint = "" if s.pre_voxel_cleanup else " Enable 'Voxel Cleanup' in Pre-processing."
@@ -687,6 +689,31 @@ def bake_multires(context, obj, ref, s):
 # Main entry point
 # ---------------------------------------------------------------------------
 
+GENERATED_TAG = "auto_retopo_generated"
+
+
+def generated_materials(objects):
+    """Materials created by the add-on (baked game materials) used by ``objects``."""
+    mats = set()
+    for ob in objects:
+        if ob.type == 'MESH':
+            mats.update(m for m in ob.data.materials if m is not None and m.get(GENERATED_TAG))
+    return mats
+
+
+def purge_generated(materials):
+    """Remove add-on generated materials (and their baked images) nobody uses any more."""
+    for mat in list(materials):
+        if mat.users:
+            continue
+        images = [n.image for n in mat.node_tree.nodes
+                  if n.type == 'TEX_IMAGE' and n.image is not None] if mat.node_tree else []
+        bpy.data.materials.remove(mat)
+        for img in images:
+            if img.get(GENERATED_TAG) and img.users <= (1 if img.use_fake_user else 0):
+                bpy.data.images.remove(img)
+
+
 def find_previous_results(original):
     return [o for o in bpy.data.objects if o is not original and o.auto_retopo_source is original]
 
@@ -708,10 +735,14 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
         raise RetopoError(f"'{original.name}' is not a mesh")
 
     replace = s.output_mode == 'REPLACE'
+    rebuild_mode = s.method == 'REBUILD'
+    if rebuild_mode:
+        from . import rebuild
     # In replace mode nothing may reference the original -> bake everything.
-    bake_sw = s.sw_apply or replace
-    bake_dt = s.transfer_apply or replace
-    bake_mirror = s.symmetry_apply or replace or s.subdiv_mode == 'MULTIRES'
+    # The game-ready rebuild always produces a self-contained, fully applied mesh.
+    bake_sw = s.sw_apply or replace or rebuild_mode
+    bake_dt = s.transfer_apply or replace or rebuild_mode
+    bake_mirror = s.symmetry_apply or replace or s.subdiv_mode == 'MULTIRES' or rebuild_mode
     axis = AXIS_INDEX[s.symmetry_axis]
 
     # ---- 1. Reference mesh -------------------------------------------------
@@ -742,11 +773,15 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
         bpy.data.meshes.remove(ref_me)
         raise RetopoError(f"'{original.name}' has no faces to retopologize")
     input_faces = len(bm.faces)
+    input_tris = bm_tri_count(bm)
     area = bm_area(bm)
     bm.to_mesh(ref_me)
     bm.free()
 
     target, edge = compute_density(s, input_faces, area)
+    if rebuild_mode:
+        target = rebuild.triangle_budget(s, input_tris, area)  # triangles
+        edge = rebuild.edge_for_budget(target, area)
 
     ref = bpy.data.objects.new(PREFIX + original.name + "_ref", ref_me)
     context.scene.collection.objects.link(ref)
@@ -778,8 +813,9 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
     success = False
     try:
         # ---- 2. Remesh -----------------------------------------------------
-        if use_shell or (s.method == 'QUADRIFLOW' and s.pre_voxel_cleanup):
-            shell_voxel = clamp_voxel_size(work.data, edge / s.pre_voxel_detail,
+        if use_shell or rebuild_mode or (s.method == 'QUADRIFLOW' and s.pre_voxel_cleanup):
+            detail = s.gr_shell_detail if rebuild_mode else s.pre_voxel_detail
+            shell_voxel = clamp_voxel_size(work.data, edge / detail,
                                            max_voxel_res, warnings, "Cleanup voxel")
         if s.method == 'QUADRIFLOW':
             if s.pre_voxel_cleanup:
@@ -801,6 +837,15 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
         elif s.method == 'DECIMATE':
             step("Decimating")
             run_decimate(context, work, s, target)
+        elif rebuild_mode:
+            # Throw the original topology away: start from a watertight shell.
+            step("Building watertight shell")
+            voxel_remesh(context, work, shell_voxel, fix_poles=False, preserve_volume=False)
+            if use_shell:
+                proj = make_shell(work.data.copy())
+            if s.pre_decimate:
+                step("Pre-decimating")
+                decimate_to(context, work, s.pre_decimate_max_faces * 2)
         elif s.method == 'OCTREE':
             if s.pre_decimate:
                 step("Pre-decimating")
@@ -823,6 +868,19 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
         else:
             project_fn = make_projector(bvh_from_mesh(proj.data))
 
+        winner = None
+        hi_me = proj.data if proj is not ref else ref_me
+        sw_target = proj  # shrinkwrap / multires target
+        if rebuild_mode:
+            winner, n_candidates = rebuild.build_best_candidate(
+                context, work, s, target, edge, project_fn, hi_me, ref_me,
+                make_projector(orig_bvh), warnings, step)
+            if winner['style'] == 'DIRECT':
+                # Keep separate / intersecting parts where they are: no outer shell.
+                project_fn = make_projector(orig_bvh)
+                sw_target = ref
+                hybrid = False
+
         # ---- 3. Cleanup, symmetry, relax ----------------------------------
         step("Cleaning topology")
         merge_eps = max(s.symmetry_merge, edge * 1e-3)
@@ -835,7 +893,8 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
                 bmesh.ops.dissolve_degenerate(bm, edges=bm.edges[:], dist=edge * 1e-3)
             if s.post_merge_distance > 0.0:
                 bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=s.post_merge_distance)
-            if s.post_tris_to_quads and not (s.method == 'DECIMATE' and s.dc_triangulate):
+            if s.post_tris_to_quads and not rebuild_mode \
+                    and not (s.method == 'DECIMATE' and s.dc_triangulate):
                 tris_to_quads(bm, s.post_quad_face_angle, s.post_quad_shape_angle)
             if s.use_symmetry:
                 symmetry_cut(bm, axis, s.symmetry_side, merge_eps, edge)
@@ -852,7 +911,7 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
         # ---- 4. Projection & mirror (baked parts) -------------------------
         if s.use_shrinkwrap and bake_sw:
             step("Shrinkwrap")
-            add_shrinkwrap(work, proj, s)
+            add_shrinkwrap(work, sw_target, s)
             apply_all_modifiers(context, work)
             exact = hybrid and s.sw_mode == 'ON_SURFACE' and s.sw_offset == 0.0
 
@@ -880,13 +939,27 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
                                       quad_method=s.post_triangulate_method, ngon_method='BEAUTY')
             apply_shading(bm, s.shading, s.auto_smooth_angle)
 
-        edit_bmesh(work, finalize)
-        if s.shading != 'KEEP' and hasattr(work.data, "use_auto_smooth"):  # Blender < 4.1
-            work.data.use_auto_smooth = s.shading == 'AUTO'
-            work.data.auto_smooth_angle = math.pi
+        if rebuild_mode:
+            step("Applying game mesh rules")
+            edit_bmesh(work, rebuild.finish_topology, s)
+            if hasattr(work.data, "use_auto_smooth"):  # Blender < 4.1
+                work.data.use_auto_smooth = True
+                work.data.auto_smooth_angle = math.pi
+        else:
+            edit_bmesh(work, finalize)
+            if s.shading != 'KEEP' and hasattr(work.data, "use_auto_smooth"):  # Blender < 4.1
+                work.data.use_auto_smooth = s.shading == 'AUTO'
+                work.data.auto_smooth_angle = math.pi
 
         # ---- 5. UVs and data transfer --------------------------------------
-        if s.uv_mode in {'SMART', 'LIGHTMAP'}:
+        if rebuild_mode:
+            if s.gr_unwrap:
+                step("Unwrapping & packing UVs")
+                rebuild.game_unwrap(context, work, s, warnings)
+            else:
+                for uv in list(work.data.uv_layers):
+                    work.data.uv_layers.remove(uv)
+        elif s.uv_mode in {'SMART', 'LIGHTMAP'}:
             step("Unwrapping UVs")
             for uv in list(work.data.uv_layers):
                 work.data.uv_layers.remove(uv)
@@ -895,7 +968,7 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
             for uv in list(work.data.uv_layers):
                 work.data.uv_layers.remove(uv)
 
-        transfer_uvs = s.uv_mode == 'TRANSFER'
+        transfer_uvs = s.uv_mode == 'TRANSFER' and not rebuild_mode
         if transfer_uvs and not ref_me.uv_layers:
             warnings.append(f"'{original.name}' has no UV maps to transfer")
             transfer_uvs = False
@@ -904,6 +977,10 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
             step("Transferring data")
             add_data_transfer(context, work, ref, s, transfer_uvs)
             apply_all_modifiers(context, work)
+
+        if rebuild_mode and s.gr_shading == 'WEIGHTED':
+            step("Weighted normals")
+            rebuild.apply_weighted_normals(context, work, s)
 
         if s.copy_materials:
             work.data.materials.clear()
@@ -932,16 +1009,42 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
             result = original
         else:
             if s.replace_previous:
-                for old in find_previous_results(original):
+                previous = find_previous_results(original)
+                old_mats = generated_materials(previous)
+                for old in previous:
                     remove_object(old)
+                purge_generated(old_mats)
                 result.name = original.name + s.name_suffix
                 result.data.name = result.name
             result.auto_retopo_source = original
 
+        # ---- 6b. Game-ready extras -----------------------------------------
+        report, images, lods = None, [], []
+        if rebuild_mode:
+            step("Measuring quality")
+            diag = rebuild.bounds_diagonal(hi_me)
+            report = rebuild.evaluate(result.data, orig_bvh, rebuild.surface_samples(hi_me),
+                                      diag, s.gr_priority)
+            report.update(style=winner['style'], seed=winner['seed'], candidates=n_candidates,
+                          budget=target)
+            if s.gr_bake_normal or s.gr_bake_ao:
+                step("Baking texture maps")
+                extrusion = s.gr_cage_extrusion or rebuild.auto_extrusion(report, diag)
+                images = rebuild.bake_maps(context, result, ref, s, extrusion,
+                                           rebuild._base_color_of(original), warnings)
+            rebuild.apply_transform_options(result, s)
+            if not replace:
+                step("Generating LODs")
+                lods = rebuild.make_lods(context, result, original, s, warnings)
+            if report['tris'] > target * 1.2:
+                warnings.append(f"{report['tris']:,} triangles is over the budget of {target:,}")
+            if report['non_manifold']:
+                warnings.append(f"{report['non_manifold']} non-manifold edges remain")
+
         # ---- 7. Multires / subdivision / live modifiers --------------------
-        if s.subdiv_mode == 'MULTIRES':
+        if s.subdiv_mode == 'MULTIRES' and not rebuild_mode:
             step("Baking detail into Multires")
-            bake_multires(context, result, proj, s)
+            bake_multires(context, result, sw_target, s)
 
         live_target = original if not replace else None
         if live_target is not None:
@@ -951,7 +1054,7 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
                 add_mirror(result, axis, merge_eps)
             if dt_wanted and not bake_dt:
                 add_data_transfer(context, result, live_target, s, transfer_uvs)
-        if s.subdiv_mode == 'SUBSURF':
+        if s.subdiv_mode == 'SUBSURF' and not rebuild_mode:
             m = result.modifiers.new(PREFIX + "Subdivision", 'SUBSURF')
             m.levels = s.subdiv_levels
             m.render_levels = s.subdiv_render_levels
@@ -974,7 +1077,8 @@ def run_retopology(context, original, s, max_voxel_res=1024, progress=None):
         success = True
         output_faces = len(result.data.polygons)
         return dict(object=result, input_faces=input_faces, output_faces=output_faces,
-                    target_faces=target, time=time.time() - t0, warnings=warnings)
+                    target_faces=target, time=time.time() - t0, warnings=warnings,
+                    report=report, images=images, lods=lods)
     finally:
         if proj is not ref:
             remove_object(proj)

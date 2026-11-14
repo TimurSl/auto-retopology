@@ -21,7 +21,11 @@ class AutoRetopoPanel:
 
     @classmethod
     def poll(cls, context):
-        return context.mode in {'OBJECT', 'EDIT_MESH', 'SCULPT'}
+        return _mode_ok(context)
+
+
+def _mode_ok(context):
+    return context.mode in {'OBJECT', 'EDIT_MESH', 'SCULPT'}
 
 
 class AutoRetopoSubPanel(AutoRetopoPanel):
@@ -65,8 +69,10 @@ class AUTORETOPO_PT_main(AutoRetopoPanel, Panel):
 
         col = layout.column(align=True)
         col.row(align=True).prop(s, "density_mode", expand=True)
+        rebuild = s.method == 'REBUILD'
         if s.density_mode == 'FACES':
-            col.prop(s, "target_faces")
+            text = "Triangle Budget" if rebuild and s.gr_count_triangles else None
+            col.prop(s, "target_faces", text=text)
         elif s.density_mode == 'RATIO':
             col.prop(s, "target_ratio", slider=True)
         else:
@@ -83,7 +89,8 @@ class AUTORETOPO_PT_main(AutoRetopoPanel, Panel):
                 faces = len(ob.data.polygons)
             box.label(text=f"Input: {faces:,} faces (base mesh)", icon='MESH_DATA')
             if s.density_mode == 'FACES':
-                box.label(text=f"Target: ~{s.target_faces:,} faces", icon='MOD_REMESH')
+                unit = "triangles" if rebuild and s.gr_count_triangles else "faces"
+                box.label(text=f"Target: ~{s.target_faces:,} {unit}", icon='MOD_REMESH')
             elif s.density_mode == 'RATIO':
                 box.label(text=f"Target: ~{max(8, round(faces * s.target_ratio)):,} faces",
                           icon='MOD_REMESH')
@@ -109,7 +116,7 @@ class AUTORETOPO_PT_method(AutoRetopoSubPanel, Panel):
     def draw_header(self, context):
         s = context.scene.auto_retopo
         label = {'QUADRIFLOW': "QuadriFlow", 'VOXEL': "Voxel", 'DECIMATE': "Decimate",
-                 'OCTREE': "Octree"}[s.method]
+                 'OCTREE': "Octree", 'REBUILD': "Rebuild"}[s.method]
         self.layout.label(text=f"{label} Settings")
 
     def draw(self, context):
@@ -118,7 +125,28 @@ class AUTORETOPO_PT_method(AutoRetopoSubPanel, Panel):
         layout.use_property_decorate = False
         s = context.scene.auto_retopo
 
-        if s.method == 'QUADRIFLOW':
+        if s.method == 'REBUILD':
+            layout.prop(s, "gr_style")
+            col = layout.column(align=True)
+            sub = col.column(align=True)
+            sub.active = s.gr_style != 'ADAPTIVE'
+            sub.prop(s, "gr_candidates")
+            sub = col.column(align=True)
+            sub.active = s.gr_style == 'BEST' or s.gr_candidates > 1
+            sub.prop(s, "gr_priority")
+            layout.prop(s, "gr_count_triangles")
+            layout.prop(s, "gr_shell_detail")
+            sub = layout.column()
+            sub.active = s.gr_style != 'QUADS'
+            sub.prop(s, "gr_adaptive_quads")
+            col = layout.column(heading="Quads Preserve")
+            col.active = s.gr_style != 'ADAPTIVE'
+            col.prop(s, "qf_preserve_sharp", text="Sharp Edges")
+            col.prop(s, "qf_preserve_boundary", text="Boundaries")
+            col.prop(s, "qf_seed", text="Base Seed")
+            col.prop(s, "gr_try_direct")
+            _tip(layout, context, "Builds from scratch - the original edge flow is discarded")
+        elif s.method == 'QUADRIFLOW':
             col = layout.column(heading="Preserve")
             col.prop(s, "qf_preserve_sharp", text="Sharp Edges")
             col.prop(s, "qf_preserve_boundary", text="Boundaries")
@@ -165,6 +193,93 @@ class AUTORETOPO_PT_method(AutoRetopoSubPanel, Panel):
             sub = row.row()
             sub.active = s.oc_remove_disconnected
             sub.prop(s, "oc_threshold", slider=True)
+
+
+# ---------------------------------------------------------------------------
+# Game-Ready Rebuild
+# ---------------------------------------------------------------------------
+
+class GameReadyPanel(AutoRetopoSubPanel):
+    @classmethod
+    def poll(cls, context):
+        return _mode_ok(context) and context.scene.auto_retopo.method == 'REBUILD'
+
+
+class AUTORETOPO_PT_game_finish(GameReadyPanel, Panel):
+    bl_idname = "AUTORETOPO_PT_game_finish"
+    bl_label = "Game-Ready Finish"
+    bl_options = set()
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        s = context.scene.auto_retopo
+
+        layout.prop(s, "gr_shading")
+        col = layout.column()
+        col.active = s.gr_shading != 'SMOOTH'
+        col.prop(s, "gr_hard_angle")
+        col.prop(s, "gr_seams_at_hard")
+        row = layout.row(heading="Triangulate")
+        row.prop(s, "gr_triangulate", text="")
+        sub = row.row()
+        sub.active = s.gr_triangulate
+        sub.prop(s, "post_triangulate_method", text="")
+
+        layout.separator()
+        layout.prop(s, "gr_unwrap")
+        col = layout.column()
+        col.active = s.gr_unwrap
+        col.prop(s, "uv_angle_limit")
+        col.prop(s, "gr_texture_size")
+        col.prop(s, "gr_padding")
+
+        layout.separator()
+        layout.prop(s, "gr_origin")
+        layout.prop(s, "gr_apply_rotation")
+
+
+class AUTORETOPO_PT_game_bake(GameReadyPanel, Panel):
+    bl_idname = "AUTORETOPO_PT_game_bake"
+    bl_label = "Texture Baking"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        s = context.scene.auto_retopo
+        layout.active = s.gr_unwrap
+        col = layout.column(heading="Bake")
+        col.prop(s, "gr_bake_normal")
+        col.prop(s, "gr_bake_ao")
+        sub = layout.column()
+        sub.active = s.gr_bake_ao
+        sub.prop(s, "gr_ao_samples")
+        layout.prop(s, "gr_cage_extrusion")
+        layout.prop(s, "gr_bake_dir")
+        if not s.gr_unwrap:
+            _tip(layout, context, "Baking needs Unwrap UVs", icon='ERROR')
+        else:
+            _tip(layout, context, "Bakes with Cycles; maps go into a new game material")
+
+
+class AUTORETOPO_PT_game_lods(GameReadyPanel, Panel):
+    bl_idname = "AUTORETOPO_PT_game_lods"
+    bl_label = "LODs"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        s = context.scene.auto_retopo
+        layout.prop(s, "gr_lod_count")
+        col = layout.column()
+        col.active = s.gr_lod_count > 0
+        col.prop(s, "gr_lod_ratio", slider=True)
+        col.prop(s, "gr_lod_spread")
+        if s.output_mode == 'REPLACE':
+            _tip(layout, context, "LODs are skipped in Replace Mesh mode", icon='ERROR')
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +339,7 @@ class AUTORETOPO_PT_preprocess(AutoRetopoSubPanel, Panel):
         sub.prop(s, "pre_voxel_detail", text="Detail")
 
         col = layout.column()
-        col.active = s.method in {'QUADRIFLOW', 'OCTREE'}
+        col.active = s.method in {'QUADRIFLOW', 'OCTREE', 'REBUILD'}
         row = col.row(heading="Pre-Decimate")
         row.prop(s, "pre_decimate", text="")
         sub = row.row()
@@ -303,6 +418,10 @@ class AUTORETOPO_PT_cleanup(AutoRetopoSubPanel, Panel):
     bl_idname = "AUTORETOPO_PT_cleanup"
     bl_label = "Topology & Shading"
 
+    @classmethod
+    def poll(cls, context):
+        return _mode_ok(context) and context.scene.auto_retopo.method != 'REBUILD'
+
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
@@ -346,7 +465,10 @@ class AUTORETOPO_PT_data(AutoRetopoSubPanel, Panel):
         layout.use_property_decorate = False
         s = context.scene.auto_retopo
 
-        layout.prop(s, "uv_mode")
+        if s.method == 'REBUILD':
+            _tip(layout, context, "UVs come from Game-Ready Finish")
+        else:
+            layout.prop(s, "uv_mode")
         if s.uv_mode == 'SMART':
             layout.prop(s, "uv_angle_limit")
         if s.uv_mode in {'SMART', 'LIGHTMAP'}:
@@ -370,6 +492,10 @@ class AUTORETOPO_PT_data(AutoRetopoSubPanel, Panel):
 class AUTORETOPO_PT_subdiv(AutoRetopoSubPanel, Panel):
     bl_idname = "AUTORETOPO_PT_subdiv"
     bl_label = "Subdivision & Detail"
+
+    @classmethod
+    def poll(cls, context):
+        return _mode_ok(context) and context.scene.auto_retopo.method != 'REBUILD'
 
     def draw(self, context):
         layout = self.layout
@@ -443,10 +569,16 @@ class AUTORETOPO_PT_tools(AutoRetopoSubPanel, Panel):
             grid.label(text=value)
 
         faces = max(st.faces, 1)
+        if st.has_report:
+            stat("Game Triangles", f"{st.tri_count:,} / {st.budget:,}")
+            stat("Shape Deviation", f"{st.dev_avg:.2f}% avg, {st.dev_max:.2f}% max")
+            stat("Winner", st.winner)
+            stat("Baked Maps", st.maps)
+            stat("LOD Triangles", st.lods)
         stat("Vertices", f"{st.verts:,}")
         stat("Faces", f"{st.faces:,}")
         stat("Quads", f"{st.quads:,} ({100.0 * st.quads / faces:.1f}%)")
-        stat("Triangles", f"{st.tris:,}")
+        stat("Triangles (faces)", f"{st.tris:,}")
         stat("N-gons", f"{st.ngons:,}")
         stat("Poles", f"{st.poles:,}")
         stat("Islands", f"{st.islands:,}")
@@ -485,6 +617,9 @@ def menu_func(self, context):
 panels = (
     AUTORETOPO_PT_main,
     AUTORETOPO_PT_method,
+    AUTORETOPO_PT_game_finish,
+    AUTORETOPO_PT_game_bake,
+    AUTORETOPO_PT_game_lods,
     AUTORETOPO_PT_preprocess,
     AUTORETOPO_PT_symmetry,
     AUTORETOPO_PT_projection,
